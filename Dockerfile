@@ -1,46 +1,52 @@
 # -------- Base image --------
 FROM python:3.11-slim AS base
 
-# Install OS deps + curl (for uv install)
+# Install OS deps + curl + tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates tini \
+    curl ca-certificates tini build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
+# Install uv (https://docs.astral.sh/uv/)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Set working directory
+# Ensure uv is on PATH (new installer puts it in /root/.local/bin)
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Working directory
 WORKDIR /app
 
-# Prevent Python from writing pyc files and buffering stdout/stderr
+# Prevent Python from writing pyc files / buffering output
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# -------- Dependency layer --------
-# Copy only dependency files (for Docker layer caching)
+# -------- Dependency layer (cached) --------
+# Copy dependency descriptors
 COPY pyproject.toml uv.lock* ./
 
-# Install dependencies in a local venv (no dev deps in prod)
+# Install project dependencies (without dev deps)
 RUN uv sync --frozen --no-dev
 
-# Set the PATH to use the uv-created virtualenv
+# Activate uv’s venv
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# -------- Copy app code --------
+# -------- Copy application code --------
 COPY . .
 
-# Optional security: run as non-root
+# Security best practice: drop root
 RUN useradd -u 10001 -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# -------- Environment variables --------
+# -------- Environment --------
 ENV HOST=0.0.0.0 \
     PORT=8080
 
-# Use tini for proper signal handling (graceful shutdown)
+# Cloud Run will inject the PORT env var automatically
+# Mount your service account secret at /secrets/rsvp/service_account_rsvp.json
+# and set GOOGLE_APPLICATION_CREDENTIALS accordingly in the Cloud Run UI
+
+# Use tini for proper signal handling
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# -------- Run the FastAPI app --------
+# -------- Start the app --------
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
