@@ -1,220 +1,243 @@
-# main.py
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Query
-from pydantic import BaseModel, Field
-import gspread
-from typing import Optional
+import os
 import logging
 from datetime import datetime
-import os
+from typing import Optional
 
-# ----------------------------
-# App & Router Setup
-# ----------------------------
+import gspread
+from fastapi import FastAPI, HTTPException, Security, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
+
+# NEW: for ADC fallback
+from google.auth import default as google_auth_default
+from google.auth.exceptions import DefaultCredentialsError
+
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-app = FastAPI(title="Wedding RSVP Microservice", version="1.0.0")
-router = APIRouter(prefix="/wedding")
+# --------------------------------------------------
+# App Setup
+# --------------------------------------------------
+app = FastAPI(
+    title="Wedding RSVP API",
+    description="FastAPI microservice for handling RSVPs via Google Sheets",
+    version="1.0.0",
+)
 
-# ----------------------------
-# Google Sheets Configuration
-# ----------------------------
-# IMPORTANT: You’ve chosen to store the service account file in the repo root.
-SERVICE_ACCOUNT_FILE_PATH = "service_account_rsvp.json"
+# Allow all CORS origins (adjust for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Default/fallback names if you want to support name-based opening.
-# (We will prefer opening by spreadsheetId from the JSONP payload.)
-DEFAULT_SPREADSHEET_NAME = "RSVP Responses"
-WORKSHEET_NAME = "Responses"
+# --------------------------------------------------
+# Security
+# --------------------------------------------------
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+VALID_API_KEY = os.getenv("VALID_API_KEY")
 
-
-# ----------------------------
-# Pydantic model (for internal struct + response details)
-# ----------------------------
-class RSVPDetails(BaseModel):
-    full_name: str = Field(..., description="Primary attendee full name")
-    dietary_requirements: Optional[str] = None
-    rehearsal_dinner: Optional[bool] = None
-    ceremony: Optional[bool] = None
-    brunch: Optional[bool] = None
-    plus_one_name: Optional[str] = None
-    plus_one_dietary_requirements: Optional[str] = None
-    plus_one_rehearsal_dinner: Optional[bool] = None
-    plus_one_ceremony: Optional[bool] = None
-    plus_one_brunch: Optional[bool] = None
-    timestamp: Optional[str] = None
+if not VALID_API_KEY:
+    logging.warning("⚠️ No VALID_API_KEY set. The API is currently unprotected!")
 
 
-# ----------------------------
-# Dependency: Google Sheets client
-# ----------------------------
-def get_google_sheet_client() -> gspread.Client:
-    try:
-        gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE_PATH)
-        logging.info(
-            f"Authenticated with Google Sheets using file: {SERVICE_ACCOUNT_FILE_PATH}"
-        )
-        return gc
-    except Exception as e:
-        logging.error(f"Failed to authenticate with Google Sheets: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not authenticate with Google Sheets. "
-            f"Check credentials and permissions. Error: {e}",
-        )
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if VALID_API_KEY is None:
+        logging.debug("API key check disabled.")
+        return
+    if api_key != VALID_API_KEY:
+        logging.warning(f"Invalid API key attempted: {api_key[:6]}...")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    logging.debug("✅ Valid API key")
+    return api_key
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def flag_to_bool(v: Optional[str]) -> Optional[bool]:
+# --------------------------------------------------
+# Google Sheets Config
+# --------------------------------------------------
+# Defaults (can be overridden via env)
+DEFAULT_SERVICE_ACCOUNT_FILE = "service_account_rsvp.json"
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "RSVP Responses")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Responses")
+
+# Helpful scopes (Sheets + Drive to open by name)
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def _in_cloud_run() -> bool:
+    # Cloud Run sets K_SERVICE / K_REVISION / K_CONFIGURATION
+    return bool(
+        os.getenv("K_SERVICE")
+        or os.getenv("K_REVISION")
+        or os.getenv("K_CONFIGURATION")
+    )
+
+
+def _resolve_credentials_path() -> Optional[str]:
     """
-    Convert JSONP flags:
-      '1' -> True
-      '0' -> False
-      '' or None -> None
+    Resolve where the credentials file should be:
+    - In Cloud Run (prod): GOOGLE_APPLICATION_CREDENTIALS (mounted secret path)
+    - Else: local file 'service_account_rsvp.json' (dev)
     """
-    if v is None or v == "":
-        return None
-    return v == "1"
+    # If user provided explicit path (e.g., mounted secret)
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv(
+        "SERVICE_ACCOUNT_FILE"
+    )
+    if env_path and os.path.isfile(env_path):
+        logging.info(f"Using credentials file from env path: {env_path}")
+        return env_path
+
+    # Dev default
+    if os.path.isfile(DEFAULT_SERVICE_ACCOUNT_FILE):
+        logging.info(f"Using local credentials file: {DEFAULT_SERVICE_ACCOUNT_FILE}")
+        return DEFAULT_SERVICE_ACCOUNT_FILE
+
+    # Nothing found
+    return None
 
 
-def bool_to_yes_no(v: Optional[bool]) -> str:
-    if v is True:
-        return "Yes"
-    if v is False:
-        return "No"
-    return ""
-
-
-def jsonp_wrap(callback: Optional[str], payload: dict):
+def get_google_client() -> gspread.Client:
     """
-    If callback provided, return JS string "<callback>(<json>)",
-    else return the plain dict (FastAPI will serialize as JSON).
+    Obtain an authenticated gspread client with robust fallbacks:
+    1) If a credentials file exists (mounted secret or local), use it.
+    2) Otherwise, try Application Default Credentials (Workload Identity).
     """
-    if callback:
-        from fastapi.responses import PlainTextResponse
-        import json as _json
+    creds_path = _resolve_credentials_path()
 
-        return PlainTextResponse(
-            f"{callback}({_json.dumps(payload)})",
-            media_type="application/javascript",
-        )
-    return payload
-
-
-# ----------------------------
-# JSONP GET Endpoint
-# ----------------------------
-@router.get("/rsvp", summary="Submit RSVP via JSONP and append to Google Sheet")
-async def rsvp_jsonp(
-    # From RSVPForm.tsx (required by the client)
-    spreadsheetId: str = Query(..., description="Google Sheets spreadsheet ID"),
-    fullName: str = Query(..., description="Primary attendee full name"),
-    dietaryRequirements: Optional[str] = Query("", description="Primary dietary reqs"),
-    rehearsalDinner: Optional[str] = Query("", description="'1' or '0' (primary)"),
-    ceremony: Optional[str] = Query("", description="'1' or '0' (primary)"),
-    brunch: Optional[str] = Query("", description="'1' or '0' (primary)"),
-    plus1Name: Optional[str] = Query("", description="Plus one full name"),
-    plus1DietaryRequirements: Optional[str] = Query("", description="Plus one dietary"),
-    plus1RehearsalDinner: Optional[str] = Query(
-        "", description="'1' or '0' (plus one)"
-    ),
-    plus1Ceremony: Optional[str] = Query("", description="'1' or '0' (plus one)"),
-    plus1Brunch: Optional[str] = Query("", description="'1' or '0' (plus one)"),
-    timestamp: Optional[str] = Query(None, description="ISO timestamp from client"),
-    callback: Optional[str] = Query(None, description="JSONP callback name"),
-    gc: gspread.Client = Depends(get_google_sheet_client),
-):
-    """
-    Receives RSVP data (via JSONP GET) and appends as a row to the target Google Sheet.
-    Returns JSONP if `callback` is provided; otherwise returns plain JSON.
-    """
-    # Basic validation mirroring the frontend
-    if not fullName.strip():
-        return jsonp_wrap(
-            callback, {"success": False, "error": "Full name is required"}
-        )
-
-    try:
-        # Open by spreadsheet ID (from the client), then select worksheet
+    # 1) Service account file path (mounted secret in prod or local in dev)
+    if creds_path:
         try:
-            spreadsheet = gc.open_by_key(spreadsheetId)
-        except Exception:
-            # Optional fallback to the default name if needed (comment out if not wanted)
-            spreadsheet = gc.open(DEFAULT_SPREADSHEET_NAME)
+            client = gspread.service_account(filename=creds_path, scopes=GOOGLE_SCOPES)
+            logging.info("Authenticated with Google Sheets via service account file.")
+            return client
+        except Exception as e:
+            logging.error(f"Service account file auth failed: {e}")
 
-        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+    # 2) ADC fallback (works if Cloud Run service account has access to the Sheet)
+    try:
+        creds, _ = google_auth_default(scopes=GOOGLE_SCOPES)
+        client = gspread.authorize(creds)
         logging.info(
-            f"Opened spreadsheet '{spreadsheet.title}', worksheet '{WORKSHEET_NAME}'"
+            "Authenticated with Google Sheets via Application Default Credentials."
         )
+        return client
+    except DefaultCredentialsError as e:
+        logging.error(f"ADC auth failed (no default credentials): {e}")
+    except Exception as e:
+        logging.error(f"ADC auth unexpected error: {e}")
 
-        # Normalize + map fields
-        details = RSVPDetails(
-            full_name=fullName.strip(),
-            dietary_requirements=(dietaryRequirements or "").strip() or None,
-            rehearsal_dinner=flag_to_bool(rehearsalDinner),
-            ceremony=flag_to_bool(ceremony),
-            brunch=flag_to_bool(brunch),
-            plus_one_name=(plus1Name or "").strip() or None,
-            plus_one_dietary_requirements=(plus1DietaryRequirements or "").strip()
-            or None,
-            plus_one_rehearsal_dinner=flag_to_bool(plus1RehearsalDinner),
-            plus_one_ceremony=flag_to_bool(plus1Ceremony),
-            plus_one_brunch=flag_to_bool(plus1Brunch),
-            timestamp=timestamp or datetime.utcnow().isoformat(),
-        )
+    # If we’re here, both methods failed
+    hint = (
+        "No credentials file found and ADC failed. In Cloud Run, mount your Secret at "
+        "e.g. /secrets/rsvp/service_account_rsvp.json and set "
+        "GOOGLE_APPLICATION_CREDENTIALS=/secrets/rsvp/service_account_rsvp.json. "
+        "Locally, keep service_account_rsvp.json in the project root."
+    )
+    raise HTTPException(
+        status_code=500,
+        detail=f"Google Sheets authentication failed. {hint}",
+    )
 
-        # Prepare row in the same style as your working POST endpoint
+
+# --------------------------------------------------
+# Data Model
+# --------------------------------------------------
+class RSVPData(BaseModel):
+    full_name: str = Field(..., description="Primary guest full name")
+    dietary_requirements: Optional[str] = Field(
+        None, description="Primary dietary needs"
+    )
+    rehearsal_dinner: Optional[bool] = Field(
+        None, description="Attending rehearsal dinner"
+    )
+    ceremony: Optional[bool] = Field(None, description="Attending ceremony")
+    brunch: Optional[bool] = Field(None, description="Attending brunch")
+    plus_one_name: Optional[str] = Field(None, description="Plus one full name")
+    plus_one_dietary_requirements: Optional[str] = Field(
+        None, description="Plus one dietary needs"
+    )
+    plus_one_rehearsal_dinner: Optional[bool] = Field(
+        None, description="Plus one attending rehearsal dinner"
+    )
+    plus_one_ceremony: Optional[bool] = Field(
+        None, description="Plus one attending ceremony"
+    )
+    plus_one_brunch: Optional[bool] = Field(
+        None, description="Plus one attending brunch"
+    )
+
+
+# --------------------------------------------------
+# Endpoint
+# --------------------------------------------------
+@app.post("/rsvp", summary="Submit RSVP", dependencies=[Depends(verify_api_key)])
+async def submit_rsvp(data: RSVPData):
+    """
+    Accepts RSVP data and appends it to a Google Sheet.
+    """
+    try:
+        client = get_google_client()
+        sheet = client.open(SPREADSHEET_NAME)
+        worksheet = sheet.worksheet(WORKSHEET_NAME)
+        logging.info(f"Opened worksheet '{WORKSHEET_NAME}' in '{SPREADSHEET_NAME}'.")
+
+        # Convert booleans to Yes/No/blank
+        def yes_no(val: Optional[bool]) -> str:
+            if val is True:
+                return "Yes"
+            elif val is False:
+                return "No"
+            return ""
+
         row = [
-            details.full_name,
-            details.dietary_requirements or "",
-            bool_to_yes_no(details.rehearsal_dinner),
-            bool_to_yes_no(details.ceremony),
-            bool_to_yes_no(details.brunch),
-            details.plus_one_name or "",
-            details.plus_one_dietary_requirements or "",
-            bool_to_yes_no(details.plus_one_rehearsal_dinner),
-            bool_to_yes_no(details.plus_one_ceremony),
-            bool_to_yes_no(details.plus_one_brunch),
-            # If you want to store timestamp as well, uncomment:
-            # details.timestamp or "",
+            data.full_name,
+            data.dietary_requirements or "",
+            yes_no(data.rehearsal_dinner),
+            yes_no(data.ceremony),
+            yes_no(data.brunch),
+            data.plus_one_name or "",
+            data.plus_one_dietary_requirements or "",
+            yes_no(data.plus_one_rehearsal_dinner),
+            yes_no(data.plus_one_ceremony),
+            yes_no(data.plus_one_brunch),
+            datetime.utcnow().isoformat(),
         ]
 
         worksheet.append_row(row)
-        logging.info(f"Successfully appended row for: {details.full_name}")
+        logging.info(f"RSVP recorded for {data.full_name}")
 
-        response = {
+        return {
             "success": True,
             "message": "RSVP submitted successfully!",
-            "details": details.model_dump(),
+            "details": data.model_dump(),
         }
-        return jsonp_wrap(callback, response)
 
     except gspread.exceptions.SpreadsheetNotFound:
-        msg = "Google Sheet not found. Check spreadsheetId and sharing permissions."
-        logging.error(msg)
-        return jsonp_wrap(callback, {"success": False, "error": msg})
-
-    except gspread.exceptions.WorksheetNotFound:
-        msg = f"Worksheet '{WORKSHEET_NAME}' not found. Check the worksheet name."
-        logging.error(msg)
-        return jsonp_wrap(callback, {"success": False, "error": msg})
-
-    except Exception as e:
-        logging.error(f"Unexpected error while submitting RSVP: {e}", exc_info=True)
-        return jsonp_wrap(
-            callback,
-            {
-                "success": False,
-                "error": f"An error occurred while submitting your RSVP: {e}",
-            },
+        raise HTTPException(
+            status_code=404,
+            detail=f"Spreadsheet '{SPREADSHEET_NAME}' not found. Check sharing and name.",
         )
+    except gspread.exceptions.WorksheetNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Worksheet '{WORKSHEET_NAME}' not found in spreadsheet.",
+        )
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Mount the router on the app
-app.include_router(router)
-
-# If running directly:
-#   uvicorn main:app --host 0.0.0.0 --port 8000
+# --------------------------------------------------
+# Run with: uvicorn main:app --reload
+# --------------------------------------------------
