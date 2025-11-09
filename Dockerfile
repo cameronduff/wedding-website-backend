@@ -20,10 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # -------- Dependency layer (cached) --------
-# Copy dependency descriptors
 COPY pyproject.toml uv.lock* ./
-
-# Install project dependencies (without dev deps)
 RUN uv sync --frozen --no-dev
 
 # Activate uv’s venv
@@ -32,6 +29,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # -------- Copy application code --------
 COPY . .
+
+# Optional sanity check: ensure uvicorn installed
+RUN uv pip show uvicorn || echo "⚠️ uvicorn not found! Add 'uvicorn[standard]' to pyproject.toml"
 
 # Security best practice: drop root
 RUN useradd -u 10001 -m appuser && chown -R appuser:appuser /app
@@ -49,4 +49,4 @@ ENV HOST=0.0.0.0 \
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # -------- Start the app --------
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
