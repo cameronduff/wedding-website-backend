@@ -31,7 +31,7 @@ app = FastAPI(
 
 origins = [
     "http://localhost:3000",  # Local React dev
-    "https://your-frontend-domain.com",  # Production
+    "https://camandelisha.com",  # Production
 ]
 
 # Allow all CORS origins (adjust for production)
